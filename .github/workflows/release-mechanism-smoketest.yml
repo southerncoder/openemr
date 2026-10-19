@@ -27,6 +27,21 @@ name: Release Mechanism Smoke Test
 # hardening of release-prep.yml (or new release-mechanism workflow)
 # that drops or misconfigures GH_TOKEN breaks this smoke test in CI
 # before the change lands.
+#
+# Expanded 2026-10-18 (G31/G33/G48 systemic follow-up: "smoketest
+# coverage gaps around the branch-cut workflow shape"): the path
+# filters above already gate on branch-cut-automation.yml +
+# patch-prep-automation.yml, but until this expansion the only job ran
+# `openemr:release-prep`. Two additional jobs below mirror the
+# branch-cut and patch-prep workflow SHAPES end-to-end -- sparse
+# composite-action checkout, dual per-side full checkouts, the real
+# mutator commands with the same --skip-globals + explicit-GH_TOKEN
+# env plumbing -- minus everything with side effects (no app-token
+# mint, no peter-evans PR step; diffs are summarized + discarded).
+# Targets auto-derive from master's version.php + the
+# release-targets.yml "latest" row (same shared, BATS-covered picker
+# the recovery-path smoketest uses), so the simulations follow the
+# current release state and never go stale.
 
 on:
   pull_request:
@@ -156,3 +171,451 @@ jobs:
         # depend on the working tree, but keeps the run's final state
         # clean if a future step is added.
         git checkout -- .
+        git clean -qfd
+
+  # ---------------------------------------------------------------------
+  # Branch-cut shape smoketest (G31/G33/G48 systemic follow-up).
+  #
+  # Mirrors branch-cut-automation.yml's job shape end-to-end minus the
+  # token mint + PR opening: sparse composite-action checkout, dual
+  # per-side full checkouts, the real `openemr:branch-cut` invocations
+  # with the same CLI + env plumbing. The rel-side run simulates a
+  # freshly-cut rel-NNN0 by running the rel-side mutators against
+  # master's tip -- which is verbatim what a cut produces (the branch
+  # inherits master's tree). The master-side run re-runs the pending
+  # cut of that same rel-NNN0 in place.
+  #
+  # Zero side effects: no PRs, no pushes, no dispatches. Diffs are
+  # summarized + discarded. Mutators are rerun-idempotent (validated:
+  # run 2 of a patch-prep sequence reports "0 file(s) changed").
+  # ---------------------------------------------------------------------
+  smoketest-branch-cut:
+    name: openemr:branch-cut shape smoketest (rel + master)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    # Exact same sparse pattern + cone-mode=false as
+    # branch-cut-automation.yml's first checkout (plus the shared
+    # target-picker script). This is the shape that produced the G31
+    # #13480/#13509 sparse-checkout leaks and G48's same-class
+    # recurrence -- materialized-file assertions below catch that
+    # regression class at land time.
+    - name: Checkout composite actions (sparse, mirrors branch-cut-automation)
+      uses: actions/checkout@v7
+      with:
+        sparse-checkout: |
+          .github/actions/generate-app-token
+          .github/actions/setup-php-composer
+          .github/scripts
+        sparse-checkout-cone-mode: false
+        persist-credentials: false
+
+    - name: Assert composite actions materialized
+      run: |
+        # G31's #13480/#13509 failure signature: the sparse first
+        # checkout pruned files the workspace root needs, and a later
+        # full checkout never re-created them. Fails here rather than
+        # at step-load time (where the error message is opaque).
+        test -f .github/actions/generate-app-token/action.yml
+        test -f .github/actions/setup-php-composer/action.yml
+        test -f .github/scripts/pick-smoketest-target.sh
+
+    - name: Setup PHP and Composer (shared)
+      uses: ./.github/actions/setup-php-composer
+      with:
+        php-version: '8.5'
+        skip-composer-install: 'true'
+
+    - name: Resolve targets (master version.php + release-targets latest row)
+      id: resolve
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        # Latest shipped release line (e.g. "rel-840 v8_4_1"), read from
+        # MASTER's copy of release-targets.yml via the gh API so this
+        # matches master's authoritative state even when the PR tree
+        # differs. The sparse checkout doesn't carry release-targets.yml
+        # (it's not workspace-root-needed in the real workflow either).
+        gh api "repos/${REPO}/contents/.github/release-targets.yml?ref=master" \
+          --jq '.content' | base64 -d > "${RUNNER_TEMP}/release-targets.yml"
+        LATEST_ROW=$(RELEASE_TARGETS_FILE="${RUNNER_TEMP}/release-targets.yml" \
+          .github/scripts/pick-smoketest-target.sh)
+        PREV_REL_BRANCH="${LATEST_ROW%% *}"
+
+        # Master's version.php defines the plausible next cut. A cut of
+        # rel-NNN0 for "M.m.0" is only the CURRENT cycle while master is
+        # at "M.m.0-dev" -- which is master's standing state between
+        # cuts. Derive everything from it so this never goes stale.
+        RAW=$(gh api "repos/${REPO}/contents/version.php?ref=master" --jq '.content' | base64 -d)
+        MAJOR=$(printf '%s\n' "${RAW}" | grep -oP "^\$v_major\s*=\s*'\K[^']*")
+        MINOR=$(printf '%s\n' "${RAW}" | grep -oP "^\$v_minor\s*=\s*'\K[^']*")
+        PATCH=$(printf '%s\n' "${RAW}" | grep -oP "^\$v_patch\s*=\s*'\K[^']*")
+        TAG=$(printf '%s\n' "${RAW}" | grep -oP "^\$v_tag\s*=\s*'\K[^']*")
+
+        if [ -z "${MAJOR}" ] || [ -z "${MINOR}" ] || [ -z "${PATCH}" ] || [ -z "${TAG}" ]; then
+            echo "::warning::Could not parse master's version.php; skipping branch-cut shape smoketest."
+            echo "should-run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+        fi
+        # Gate: only meaningful while master is mid-gap at X.Y.0-dev --
+        # the standing between-cuts state. Otherwise (malformed state)
+        # skip cleanly rather than simulate against an incoherent tree.
+        if [ "${PATCH}" != '0' ] || [ "${TAG}" != '-dev' ]; then
+            echo "::warning::master version.php is '${MAJOR}.${MINOR}.${PATCH}${TAG}', not X.Y.0-dev; branch-cut sim not meaningful now, skipping."
+            echo "should-run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+        fi
+        TARGET_VERSION="${MAJOR}.${MINOR}.0"
+        REL_BRANCH="rel-${MAJOR}${MINOR}0"
+        if [ "${REL_BRANCH}" = "${PREV_REL_BRANCH}" ]; then
+            echo "::error::derived rel-branch ${REL_BRANCH} equals the release-targets latest row; refusing a self-referential cut sim."
+            exit 1
+        fi
+        echo "==> Branch-cut sim targets: rel_branch=${REL_BRANCH} target_version=${TARGET_VERSION} prev_rel_branch=${PREV_REL_BRANCH}"
+        {
+          echo "should-run=true"
+          echo "target-version=${TARGET_VERSION}"
+          echo "rel-branch=${REL_BRANCH}"
+          echo "prev-rel-branch=${PREV_REL_BRANCH}"
+        } >> "$GITHUB_OUTPUT"
+
+    # --- Rel-side (simulates the freshly-cut rel branch: master's tip) -
+    - name: Checkout master tip as fresh-cut simulation (rel side)
+      if: steps.resolve.outputs.should-run == 'true'
+      uses: actions/checkout@v7
+      with:
+        ref: master
+        path: rel-checkout
+        # Smoketest never pushes; github.token read-only use. The real
+        # workflow mints an App token here (needs repo secrets -- not
+        # available on fork PRs), so the smoketest skips the mint.
+        fetch-depth: 0
+        # Hardened shape: any env-plumbing regression downstream is
+        # caught by the explicit GH_TOKEN on the mutator steps.
+        persist-credentials: false
+
+    - name: Install Composer dependencies (rel-checkout)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: rel-checkout
+      shell: bash
+      run: composer install --prefer-dist --no-progress --no-interaction
+
+    - name: Run branch-cut mutators (rel side)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: rel-checkout
+      env:
+        # Same env shape as branch-cut-automation.yml's mutator steps
+        # (which pass the App token). github.token keeps the same
+        # contract: an explicit env that survives persist-credentials:
+        # false on the checkout above.
+        GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ steps.resolve.outputs.target-version }}
+        REL_BRANCH: ${{ steps.resolve.outputs.rel-branch }}
+        PREV_REL_BRANCH: ${{ steps.resolve.outputs.prev-rel-branch }}
+      run: |
+        php bin/console openemr:branch-cut \
+          --skip-globals \
+          --target-version="${VERSION}" \
+          --rel-branch="${REL_BRANCH}" \
+          --prev-rel-branch="${PREV_REL_BRANCH}" \
+          --side=rel
+
+    - name: Show rel-side diff (informational, does not fail the job)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: rel-checkout
+      env:
+        TARGET_VERSION: ${{ steps.resolve.outputs.target-version }}
+        REL_BRANCH: ${{ steps.resolve.outputs.rel-branch }}
+      run: |
+        {
+          echo '## branch-cut rel-side sim diff (informational)'
+          echo ''
+          echo "Simulates freshly-cut \`${REL_BRANCH}\` (target ${TARGET_VERSION}) from master's tip: rel-side mutators only."
+          echo 'All mutations are discarded -- shown for eyeball verification only.'
+          echo ''
+          echo '```diff'
+          git diff --stat || true
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Discard rel-side mutations
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: rel-checkout
+      run: |
+        git checkout -- .
+        git clean -qfd
+
+    # --- Master-side (re-runs the pending cut in place) -----------------
+    - name: Checkout master (master side)
+      if: steps.resolve.outputs.should-run == 'true'
+      uses: actions/checkout@v7
+      with:
+        ref: master
+        path: master-checkout
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Install Composer dependencies (master-checkout)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: master-checkout
+      shell: bash
+      run: composer install --prefer-dist --no-progress --no-interaction
+
+    - name: Run branch-cut mutators (master side)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: master-checkout
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ steps.resolve.outputs.target-version }}
+        REL_BRANCH: ${{ steps.resolve.outputs.rel-branch }}
+        PREV_REL_BRANCH: ${{ steps.resolve.outputs.prev-rel-branch }}
+      run: |
+        php bin/console openemr:branch-cut \
+          --skip-globals \
+          --target-version="${VERSION}" \
+          --rel-branch="${REL_BRANCH}" \
+          --prev-rel-branch="${PREV_REL_BRANCH}" \
+          --side=master
+
+    - name: Show master-side diff (informational, does not fail the job)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: master-checkout
+      env:
+        TARGET_VERSION: ${{ steps.resolve.outputs.target-version }}
+        REL_BRANCH: ${{ steps.resolve.outputs.rel-branch }}
+      run: |
+        {
+          echo '## branch-cut master-side sim diff (informational)'
+          echo ''
+          echo "Re-runs the pending cut of \`${REL_BRANCH}\` (target ${TARGET_VERSION}) in place against master: master-side mutators only (version.php advance, SQL skeleton, release-targets row, docker scaffold, swagger regen)."
+          echo 'All mutations are discarded -- shown for eyeball verification only.'
+          echo ''
+          echo '```diff'
+          git diff --stat || true
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Discard master-side mutations
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: master-checkout
+      run: |
+        git checkout -- .
+        git clean -qfd
+
+  # ---------------------------------------------------------------------
+  # Patch-prep shape smoketest (G31/G33/G48 systemic follow-up).
+  #
+  # Mirrors patch-prep-automation.yml's job shape minus PR opening:
+  # sparse composite-action checkout + dual per-side full checkouts +
+  # the real `openemr:patch-prep` invocations. The rel-side run
+  # simulates the start of the next patch cycle on the current latest
+  # rel branch (from release-targets.yml's "latest" row); the
+  # master-side run re-runs the same pending patch-prep in place
+  # against master (SQL bridge rename + release-targets row + docker
+  # scaffold). Same zero-side-effect contract as the branch-cut job:
+  # no PRs, no pushes; diffs summarized + discarded.
+  # ---------------------------------------------------------------------
+  smoketest-patch-prep:
+    name: openemr:patch-prep shape smoketest (rel + master)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout composite actions (sparse, mirrors patch-prep-automation)
+      uses: actions/checkout@v7
+      with:
+        sparse-checkout: |
+          .github/actions/generate-app-token
+          .github/actions/setup-php-composer
+          .github/scripts
+        sparse-checkout-cone-mode: false
+        persist-credentials: false
+
+    - name: Assert composite actions materialized
+      run: |
+        test -f .github/actions/generate-app-token/action.yml
+        test -f .github/actions/setup-php-composer/action.yml
+        test -f .github/scripts/pick-smoketest-target.sh
+
+    - name: Setup PHP and Composer (shared)
+      uses: ./.github/actions/setup-php-composer
+      with:
+        php-version: '8.5'
+        skip-composer-install: 'true'
+
+    - name: Resolve targets (release-targets latest row)
+      id: resolve
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        # The latest row identifies the current shipped patch line
+        # (rel-840 + v8_4_1 -> simulate its next patch-prep: target
+        # 8.4.2, prev 8.4.1). Derivation auto-follows release state:
+        # after 8.4.2 ships (latest row moves to v8_4_2), this yields
+        # target 8.4.3 -- so the sim never goes stale.
+        gh api "repos/${REPO}/contents/.github/release-targets.yml?ref=master" \
+          --jq '.content' | base64 -d > "${RUNNER_TEMP}/release-targets.yml"
+        LATEST_ROW=$(RELEASE_TARGETS_FILE="${RUNNER_TEMP}/release-targets.yml" \
+          .github/scripts/pick-smoketest-target.sh)
+        REL_BRANCH="${LATEST_ROW%% *}"
+        LATEST_TAG="${LATEST_ROW##* }"
+        PREV_VERSION=$(echo "${LATEST_TAG}" | sed -E 's/^v([0-9]+)_([0-9]+)_([0-9]+)$/\1.\2.\3/')
+        MAJOR="$(echo "${PREV_VERSION}" | cut -d. -f1)"
+        MINOR="$(echo "${PREV_VERSION}" | cut -d. -f2)"
+        PATCH="$(echo "${PREV_VERSION}" | cut -d. -f3)"
+        TARGET_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+
+        # Gate: the rel branch must be in a shape consistent with
+        # "shipped prev, next patch not yet shipped" for the sim to be
+        # meaningful. Accept the shipped pin (prev_version, --dev
+        # stripped), a mid-cycle next-dev bump (target_version-dev), or
+        # a just-shipped strip (target_version plain). Anything else is
+        # an incoherent state -> skip cleanly.
+        RAW=$(gh api "repos/${REPO}/contents/version.php?ref=${REL_BRANCH}" --jq '.content' | base64 -d)
+        RMAJOR=$(printf '%s\n' "${RAW}" | grep -oP "^\$v_major\s*=\s*'\K[^']*")
+        RMINOR=$(printf '%s\n' "${RAW}" | grep -oP "^\$v_minor\s*=\s*'\K[^']*")
+        RPATCH=$(printf '%s\n' "${RAW}" | grep -oP "^\$v_patch\s*=\s*'\K[^']*")
+        RTAG=$(printf '%s\n' "${RAW}" | grep -oP "^\$v_tag\s*=\s*'\K[^']*")
+        REL_STATE="${RMAJOR}.${RMINOR}.${RPATCH}"
+        STATE_OK='false'
+        if [ "${RMAJOR}" != "${MAJOR}" ] || [ "${RMINOR}" != "${MINOR}" ]; then
+          STATE_OK='false'
+        elif [ "${REL_STATE}" = "${PREV_VERSION}" ] && [ "${RTAG}" = '' ]; then
+          STATE_OK='true'
+        elif [ "${REL_STATE}" = "${TARGET_VERSION}" ] && [ "${RTAG}" = '-dev' ]; then
+          STATE_OK='true'
+        elif [ "${REL_STATE}" = "${TARGET_VERSION}" ] && [ "${RTAG}" = '' ]; then
+          STATE_OK='true'
+        fi
+        if [ "${STATE_OK}" != 'true' ]; then
+            echo "::warning::rel branch ${REL_BRANCH} version.php is '${REL_STATE}${RTAG}', expected '${PREV_VERSION}' (shipped pin) or '${TARGET_VERSION}-dev' (mid-cycle); patch-prep sim not meaningful now, skipping."
+            echo "should-run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+        fi
+        echo "==> Patch-prep sim targets: rel_branch=${REL_BRANCH} target_version=${TARGET_VERSION} prev_version=${PREV_VERSION}"
+        {
+          echo "should-run=true"
+          echo "target-version=${TARGET_VERSION}"
+          echo "rel-branch=${REL_BRANCH}"
+          echo "prev-version=${PREV_VERSION}"
+        } >> "$GITHUB_OUTPUT"
+
+    # --- Rel-side (simulates the next patch cycle on the rel branch) ---
+    - name: Checkout the rel branch (rel side)
+      if: steps.resolve.outputs.should-run == 'true'
+      uses: actions/checkout@v7
+      with:
+        ref: ${{ steps.resolve.outputs.rel-branch }}
+        path: rel-checkout
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Install Composer dependencies (rel-checkout)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: rel-checkout
+      shell: bash
+      run: composer install --prefer-dist --no-progress --no-interaction
+
+    - name: Run patch-prep mutators (rel side)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: rel-checkout
+      env:
+        # Same env shape as patch-prep-automation.yml's mutator steps.
+        GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ steps.resolve.outputs.target-version }}
+        REL_BRANCH: ${{ steps.resolve.outputs.rel-branch }}
+        PREV_VERSION: ${{ steps.resolve.outputs.prev-version }}
+      run: |
+        php bin/console openemr:patch-prep \
+          --skip-globals \
+          --target-version="${VERSION}" \
+          --rel-branch="${REL_BRANCH}" \
+          --prev-version="${PREV_VERSION}" \
+          --side=rel
+
+    - name: Show rel-side diff (informational, does not fail the job)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: rel-checkout
+      env:
+        TARGET_VERSION: ${{ steps.resolve.outputs.target-version }}
+        REL_BRANCH: ${{ steps.resolve.outputs.rel-branch }}
+      run: |
+        {
+          echo '## patch-prep rel-side sim diff (informational)'
+          echo ''
+          echo "Simulates the ${TARGET_VERSION} dev-cycle start on \`${REL_BRANCH}\`: docker upgrade scaffolding + next SQL upgrade skeleton."
+          echo 'All mutations are discarded -- shown for eyeball verification only.'
+          echo ''
+          echo '```diff'
+          git diff --stat || true
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Discard rel-side mutations
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: rel-checkout
+      run: |
+        git checkout -- .
+        git clean -qfd
+
+    # --- Master-side (re-runs the pending patch-prep in place) ---------
+    - name: Checkout master (master side)
+      if: steps.resolve.outputs.should-run == 'true'
+      uses: actions/checkout@v7
+      with:
+        ref: master
+        path: master-checkout
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Install Composer dependencies (master-checkout)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: master-checkout
+      shell: bash
+      run: composer install --prefer-dist --no-progress --no-interaction
+
+    - name: Run patch-prep mutators (master side)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: master-checkout
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ steps.resolve.outputs.target-version }}
+        REL_BRANCH: ${{ steps.resolve.outputs.rel-branch }}
+        PREV_VERSION: ${{ steps.resolve.outputs.prev-version }}
+      run: |
+        php bin/console openemr:patch-prep \
+          --skip-globals \
+          --target-version="${VERSION}" \
+          --rel-branch="${REL_BRANCH}" \
+          --prev-version="${PREV_VERSION}" \
+          --side=master
+
+    - name: Show master-side diff (informational, does not fail the job)
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: master-checkout
+      env:
+        TARGET_VERSION: ${{ steps.resolve.outputs.target-version }}
+        REL_BRANCH: ${{ steps.resolve.outputs.rel-branch }}
+      run: |
+        {
+          echo '## patch-prep master-side sim diff (informational)'
+          echo ''
+          echo "Re-runs the pending ${TARGET_VERSION} patch-prep in place on master: docker scaffold + skeleton + bridge rename + release-targets row."
+          echo 'All mutations are discarded -- shown for eyeball verification only.'
+          echo ''
+          echo '```diff'
+          git diff --stat || true
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Discard master-side mutations
+      if: steps.resolve.outputs.should-run == 'true'
+      working-directory: master-checkout
+      run: |
+        git checkout -- .
+        git clean -qfd
